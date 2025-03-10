@@ -11,7 +11,8 @@ use time::OffsetDateTime;
 
 pub struct CertificateAuthority {
     ca_path: PathBuf,
-    pub cert_path: PathBuf,
+    pub cert_pem_path: PathBuf,
+    pub cert_der_path: PathBuf,
     pub key_path: PathBuf,
 }
 
@@ -25,7 +26,8 @@ impl CertificateAuthority {
                 .with_context(|| format!("Failed to initialize ca path {}", &ca_path.display()))?;
         }
 
-        let cert_path = ca_path.join("ca.crt");
+        let cert_pem_path = ca_path.join("ca.crt");
+        let cert_der_path = ca_path.join("ca.der");
         let key_path = ca_path.join("ca.key").to_owned();
 
         let ca_server_path = ca_path.join("server");
@@ -49,11 +51,12 @@ impl CertificateAuthority {
 
         let ca = CertificateAuthority {
             ca_path,
-            cert_path: cert_path.clone(),
+            cert_pem_path: cert_pem_path.clone(),
+            cert_der_path: cert_der_path.clone(),
             key_path: key_path.clone(),
         };
 
-        if !cert_path.exists() || !key_path.exists() {
+        if !cert_pem_path.exists() || !key_path.exists() {
             ca.generate_ca()?
         }
 
@@ -92,7 +95,7 @@ impl CertificateAuthority {
     }
 
     pub fn cert(&self, key: &KeyPair) -> Result<Certificate> {
-        let ca_cert = fs::read_to_string(&self.cert_path)?;
+        let ca_cert = fs::read_to_string(&self.cert_pem_path).with_context(|| format!("Failed to read cert pem file"))?;
         let params = CertificateParams::from_ca_cert_pem(ca_cert.as_str())
             .with_context(|| format!("Failed to parse CA cert from existing ca.crt"))?;
         let cert = params
@@ -124,7 +127,9 @@ impl CertificateAuthority {
         let ca_key = KeyPair::generate().unwrap();
         let ca_cert = params.self_signed(&ca_key).unwrap();
 
-        fs::write(&self.cert_path, ca_cert.pem())
+        fs::write(&self.cert_pem_path, ca_cert.pem())
+            .with_context(|| format!("failed to write {}", &self.ca_path.display()))?;
+        fs::write(&self.cert_der_path, ca_cert.der())
             .with_context(|| format!("failed to write {}", &self.ca_path.display()))?;
         fs::write(&self.key_path, ca_key.serialize_pem())
             .with_context(|| format!("failed to write {}", &self.key_path.display()))?;

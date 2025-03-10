@@ -1,14 +1,15 @@
-use crate::ca;
-use crate::server;
+pub mod ca;
+pub mod server;
 
 use anyhow::Result;
 use axum::{Router, routing::get};
+use axum_server::tls_rustls::RustlsConfig;
 use core::net::SocketAddr;
 use rustls;
-use rustls::ClientConfig;
-use rustls::ServerConfig;
 use rustls::server::WebPkiClientVerifier;
-use rustls_platform_verifier::ConfigVerifierExt;
+use rustls::{ServerConfig, pki_types::PrivateKeyDer};
+use rustls_pemfile::{certs, pkcs8_private_keys};
+
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
@@ -25,44 +26,46 @@ async fn main() -> Result<(), anyhow::Error> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config = server::CaravelConfig::new();
+    let config = crate::server::CaravelConfig::new();
 
     server::initialize_dirs(&config)?;
     let ca = ca::CertificateAuthority::initialize(&config)?;
 
     // generate a test client cert
-    let client_cert = ca.generate_agent_certificate("ODIN")?;
+    let client_cert = ca.generate_agent_certificate("UO-2010933")?;
 
-    // let config = RustlsConfig::from_pem_file(
-    //     ca.server_cert_path(&config.server_name),
-    //     ca.server_key_path(&config.server_name),
-    // )
-
-    // let store = load_store_from_pem("certs/ca-cert.pem").unwrap();
-    // let tls_config = RustlsConfig::from_config(Arc::new(
-    //     ServerConfig::builder()
-    //         .with_client_cert_verifier(client_cert_verifier)
-    //         .with_single_cert(certs, private_key)
-    //         .unwrap(),
-    // ));
-    let store = load_store_from_pem("/var/lib/caravel/ca/ca.crt").unwrap();
+    // load CA certs into root store and set up client verifier
+    let ca_cert_file = &mut BufReader::new(File::open("/var/lib/caravel/ca/ca.der").unwrap());
+    let ca_cert = certs(ca_cert_file).collect::<Result<Vec<_>, _>>().unwrap();
+    let mut store = rustls::RootCertStore::empty();
+    for cert in ca_cert {
+        store.add(cert).unwrap();
+    }
     let client_verifier = WebPkiClientVerifier::builder(store.into()).build().unwrap();
-    let private_key = load_private_key_from_pem("/var/lib/caravel/server/localhost.key").unwrap();
-    let certs = load_certificates_from_pem("/var/lib/caravel/server/localhost.crt").unwrap();
+
+    // load server certs
+    let cert_file =
+        &mut BufReader::new(File::open("/var/lib/caravel/ca/server/localhost.crt").unwrap());
+    let key_file =
+        &mut BufReader::new(File::open("/var/lib/caravel/ca/server/localhost.key").unwrap());
+    let cert_chain = certs(cert_file).collect::<Result<Vec<_>, _>>().unwrap();
+    let mut keys = pkcs8_private_keys(key_file)
+        .map(|key| key.map(PrivateKeyDer::Pkcs8))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     // Build the TLS server configuration using Rustls's builder API.
     let tls_config = ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
-        .with_single_cert(certs, private_key)
+        // .with_no_client_auth()
+        .with_single_cert(cert_chain, keys.remove(0))
         .expect("failed to build TLS config");
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-
+    let server_config = RustlsConfig::from_config(Arc::new(tls_config));
     let app = Router::new().route("/", get(handler));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 9140));
     tracing::debug!("listening on {}", addr);
-    axum_server::bind(addr)
-        .acceptor(acceptor.clone())
+    axum_server::bind_rustls(addr, server_config)
         .serve(app.into_make_service())
         .await
         .unwrap();
@@ -74,31 +77,30 @@ async fn handler() -> &'static str {
     "Hello, World!"
 }
 
-pub fn load_certificates_from_pem(path: &str) -> std::io::Result<Vec<rustls::Certificate>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader).map(|c| c.unwrap().to_vec());
-
-    Ok(certs.map(rustls::Certificate).collect())
-}
-
-pub fn load_private_key_from_pem(path: &str) -> std::io::Result<rustls::PrivateKey> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let keys = rustls_pemfile::ec_private_keys(&mut reader)
-        .map(|k| k.unwrap())
-        .next()
-        .unwrap();
-
-    Ok(rustls::PrivateKey(keys.secret_sec1_der().to_vec()))
-}
-
-pub fn load_store_from_pem(path: &str) -> std::io::Result<rustls::RootCertStore> {
-    let ca_certs = load_certificates_from_pem(path)?;
-    let mut store = rustls::RootCertStore::empty();
-    for cert in &ca_certs {
-        store.add(cert).unwrap();
-    }
-
-    Ok(store)
-}
+// pub fn load_certificates_from_pem(path: &str) -> Result<CertificateDer> {
+//     // let file = File::open(path)?;
+//     // let mut reader = BufReader::new(file);
+//     // let certs = rustls_pemfile::certs(&mut reader).map(|c| c.unwrap().to_vec());
+//     let certs: Vec<_> = CertificateDer::pem_file_iter(path).unwrap().collect();
+//     let good: Vec<_> = certs.into_iter().collect();
+// }
+//
+// pub fn load_private_key_from_pem(path: &str) -> std::io::Result<PrivatePkcs8KeyDer> {
+//     let file = File::open(path)?;
+//     let mut reader = BufReader::new(file);
+//     let keys = rustls_pemfile::ec_private_keys(&mut reader)
+//         .map(|k| k.unwrap())
+//         .next()
+//         .unwrap();
+//
+//     Ok(rustls::PrivateKey(keys.secret_sec1_der().to_vec()))
+// }
+//
+// pub fn load_store_from_pem(path: &str) -> Result<rustls::RootCertStore> {
+//     let mut store = rustls::RootCertStore::empty();
+//     for cert in &ca_certs {
+//         store.add(cert).unwrap();
+//     }
+//
+//     Ok(store)
+// }
