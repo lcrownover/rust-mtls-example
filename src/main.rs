@@ -162,12 +162,12 @@ impl CertificateAuthority {
 
     pub fn generate_agent_certificate(&self, server_name: &str) -> Result<Certificate> {
         tracing::debug!("generating new agent cert");
-        self.generate_certificate("agents".into(), server_name)
+        self.generate_certificate(self.ca_path.join("agents").into(), server_name)
     }
 
     fn generate_server_certificate(&self, server_name: &str) -> Result<Certificate> {
         tracing::debug!("generating new server cert");
-        self.generate_certificate("server".into(), server_name)
+        self.generate_certificate(self.ca_path.join("server").into(), server_name)
     }
 
     fn generate_certificate(&self, cert_dir: PathBuf, server_name: &str) -> Result<Certificate> {
@@ -200,18 +200,18 @@ impl CertificateAuthority {
         let key = KeyPair::generate().unwrap();
         let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
 
-        let cert_path = cert_dir.join(format!("{}.crt", server_name));
-        tracing::debug!("writing cert to {}", cert_path.display());
-        fs::write(&cert_path, cert.pem())
-            .with_context(|| format!("failed to write server cert: {}", &cert_dir.display()))?;
-        let key_path = cert_dir.join(format!("{}.key", server_name));
-        fs::write(&key_path, key.serialize_pem())
-            .with_context(|| format!("failed to write server key: {}", &cert_dir.display()))?;
+        let cert_path = cert_dir.join(format!("{}.pem", server_name));
+        tracing::debug!("writing pem to {}", cert_path.display());
+        fs::write(
+            &cert_path,
+            format!("{}\n{}", cert.pem(), key.serialize_pem()),
+        )
+        .with_context(|| format!("failed to write server pem: {}", &cert_dir.display()))?;
         let permissions = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&key_path, permissions).with_context(|| {
+        fs::set_permissions(&cert_path, permissions).with_context(|| {
             format!(
-                "Failed to set permissions on server key: {}",
-                &key_path.display()
+                "Failed to set permissions on server pem: {}",
+                &cert_path.display()
             )
         })?;
 
