@@ -1,261 +1,18 @@
-use anyhow::{Context, Result};
+use crate::ca;
+use crate::server;
+
+use anyhow::Result;
 use axum::{Router, routing::get};
-use axum_server::tls_rustls::RustlsConfig;
 use core::net::SocketAddr;
-use rcgen::{Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa};
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::{env, fs};
+use rustls;
+use rustls::ClientConfig;
+use rustls::ServerConfig;
+use rustls::server::WebPkiClientVerifier;
+use rustls_platform_verifier::ConfigVerifierExt;
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-use rcgen::{BasicConstraints, DnValue::PrintableString, KeyPair, KeyUsagePurpose};
-use time::OffsetDateTime;
-
-struct ServerConfig {
-    pub server_name: String,
-    pub data_path: PathBuf,
-}
-
-impl ServerConfig {
-    fn new() -> Self {
-        let server_name = env::var("CARAVEL_SERVER_NAME").unwrap_or(String::from("localhost"));
-        let data_path: PathBuf = env::var("CARAVEL_DATA_PATH")
-            .unwrap_or(String::from("/var/lib/caravel"))
-            .into();
-
-        ServerConfig {
-            server_name,
-            data_path,
-        }
-    }
-}
-
-struct CertificateAuthority {
-    ca_path: PathBuf,
-    pub cert_path: PathBuf,
-    pub key_path: PathBuf,
-}
-
-impl CertificateAuthority {
-    fn initialize(config: &ServerConfig) -> Result<Self> {
-        tracing::debug!("initializing ca");
-
-        let ca_path = config.data_path.join("ca");
-        if ca_path.exists() {
-            fs::create_dir_all(&ca_path)
-                .with_context(|| format!("Failed to initialize ca path {}", &ca_path.display()))?;
-        }
-
-        let cert_path = ca_path.join("ca.crt");
-        let key_path = ca_path.join("ca.key").to_owned();
-
-        let ca_server_path = ca_path.join("server");
-        if !ca_server_path.exists() {
-            fs::create_dir_all(&ca_server_path).with_context(|| {
-                format!(
-                    "Failed to initialize ca/server path {}",
-                    &ca_server_path.display()
-                )
-            })?;
-        }
-        let ca_agents_path = ca_path.join("agents");
-        if !ca_agents_path.exists() {
-            fs::create_dir_all(&ca_agents_path).with_context(|| {
-                format!(
-                    "Failed to initialize ca/agents path {}",
-                    &ca_agents_path.display()
-                )
-            })?;
-        }
-
-        let ca = CertificateAuthority {
-            ca_path,
-            cert_path: cert_path.clone(),
-            key_path: key_path.clone(),
-        };
-
-        if !cert_path.exists() || !key_path.exists() {
-            ca.generate_ca()?
-        }
-
-        if !ca.server_cert_exists(&config.server_name) {
-            let _ = ca.generate_server_certificate(&config.server_name)?;
-        }
-
-        Ok(ca)
-    }
-
-    fn server_cert_exists(&self, server_name: &str) -> bool {
-        self.server_cert_path(server_name).exists() && self.server_cert_path(server_name).is_file()
-    }
-
-    fn server_cert_path(&self, server_name: &str) -> PathBuf {
-        self.ca_path
-            .join("server")
-            .join(format!("{}.crt", server_name))
-    }
-    fn server_key_path(&self, server_name: &str) -> PathBuf {
-        self.ca_path
-            .join("server")
-            .join(format!("{}.key", server_name))
-    }
-
-    pub fn key(&self) -> Result<KeyPair> {
-        let ca_key = fs::read_to_string(&self.key_path).with_context(|| {
-            format!(
-                "Failed to read CA key from file: {}",
-                &self.key_path.display()
-            )
-        })?;
-        let keypair = KeyPair::from_pem(ca_key.as_str())
-            .with_context(|| format!("Failed to parse CA key from ca.key"))?;
-        Ok(keypair)
-    }
-
-    pub fn cert(&self, key: &KeyPair) -> Result<Certificate> {
-        let ca_cert = fs::read_to_string(&self.cert_path)?;
-        let params = CertificateParams::from_ca_cert_pem(ca_cert.as_str())
-            .with_context(|| format!("Failed to parse CA cert from existing ca.crt"))?;
-        let cert = params
-            .self_signed(&key)
-            .with_context(|| format!("Failed to sign ca cert"))?;
-        Ok(cert)
-    }
-
-    fn generate_ca(&self) -> Result<()> {
-        tracing::debug!("generating new ca");
-        let mut params = CertificateParams::new(Vec::default())
-            .expect("empty subject alt name can't produce error");
-        let (today, forever) = validity_period();
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.distinguished_name.push(
-            DnType::CountryName,
-            PrintableString("US".try_into().unwrap()),
-        );
-        params
-            .distinguished_name
-            .push(DnType::OrganizationName, "caravel");
-        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-        params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-        params.key_usages.push(KeyUsagePurpose::CrlSign);
-
-        params.not_before = today;
-        params.not_after = forever;
-
-        let ca_key = KeyPair::generate().unwrap();
-        let ca_cert = params.self_signed(&ca_key).unwrap();
-
-        fs::write(&self.cert_path, ca_cert.pem())
-            .with_context(|| format!("failed to write {}", &self.ca_path.display()))?;
-        fs::write(&self.key_path, ca_key.serialize_pem())
-            .with_context(|| format!("failed to write {}", &self.key_path.display()))?;
-        let permissions = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&self.key_path, permissions).with_context(|| {
-            format!(
-                "Failed to set permissions on ca key path {}",
-                &self.key_path.display()
-            )
-        })?;
-
-        Ok(())
-    }
-
-    pub fn generate_agent_certificate(&self, server_name: &str) -> Result<Certificate> {
-        tracing::debug!("generating new agent cert");
-        self.generate_certificate(self.ca_path.join("agents").into(), server_name)
-    }
-
-    fn generate_server_certificate(&self, server_name: &str) -> Result<Certificate> {
-        tracing::debug!("generating new server cert");
-        self.generate_certificate(self.ca_path.join("server").into(), server_name)
-    }
-
-    fn generate_certificate(&self, cert_dir: PathBuf, server_name: &str) -> Result<Certificate> {
-        fs::create_dir_all(&cert_dir).with_context(|| {
-            format!(
-                "Failed to initialize cert directory: {}",
-                &cert_dir.display()
-            )
-        })?;
-        let mut params =
-            CertificateParams::new(vec![server_name.into()]).expect("we know the name is valid");
-        let (today, forever) = validity_period();
-        params
-            .distinguished_name
-            .push(DnType::CommonName, server_name);
-        params.use_authority_key_identifier_extension = true;
-        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-        params
-            .extended_key_usages
-            .push(ExtendedKeyUsagePurpose::ServerAuth);
-        params.not_before = today;
-        params.not_after = forever;
-
-        let ca_key = &self
-            .key()
-            .with_context(|| format!("Failed to load CA key"))?;
-        let ca_cert = &self
-            .cert(ca_key)
-            .with_context(|| format!("Failed to load CA cert"))?;
-        let key = KeyPair::generate().unwrap();
-        let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
-
-        let cert_path = cert_dir.join(format!("{}.pem", server_name));
-        tracing::debug!("writing pem to {}", cert_path.display());
-        fs::write(
-            &cert_path,
-            format!("{}\n{}", cert.pem(), key.serialize_pem()),
-        )
-        .with_context(|| format!("failed to write server pem: {}", &cert_dir.display()))?;
-        let permissions = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&cert_path, permissions).with_context(|| {
-            format!(
-                "Failed to set permissions on server pem: {}",
-                &cert_path.display()
-            )
-        })?;
-
-        Ok(cert)
-    }
-}
-
-fn initialize_dirs(config: &ServerConfig) -> Result<()> {
-    tracing::debug!("initializing data path");
-    if !config.data_path.exists() {
-        fs::create_dir_all(&config.data_path).with_context(|| {
-            format!(
-                "Failed to initialize data path {}",
-                &config.data_path.display()
-            )
-        })?;
-    }
-
-    Ok(())
-}
-
-fn validity_period() -> (OffsetDateTime, OffsetDateTime) {
-    let today = OffsetDateTime::now_utc();
-    let forever_year = today.date().year() + 30;
-    let forever = today.replace_year(forever_year).unwrap();
-    (today, forever)
-}
-
-// fn new_end_entity(ca: &Certificate, ca_key: &KeyPair) -> Certificate {
-//     let name = "client_1";
-//     let mut params = CertificateParams::new(vec![name.into()]).expect("we know the name is valid");
-//     let (yesterday, tomorrow) = validity_period();
-//     params.distinguished_name.push(DnType::CommonName, name);
-//     params.use_authority_key_identifier_extension = true;
-//     params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-//     params
-//         .extended_key_usages
-//         .push(ExtendedKeyUsagePurpose::ServerAuth);
-//     params.not_before = yesterday;
-//     params.not_after = tomorrow;
-//
-//     let key_pair = KeyPair::generate().unwrap();
-//     params.signed_by(&key_pair, ca, ca_key).unwrap()
-// }
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -268,27 +25,44 @@ async fn main() -> Result<(), anyhow::Error> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config = ServerConfig::new();
+    let config = server::CaravelConfig::new();
 
-    initialize_dirs(&config)?;
-    let ca = CertificateAuthority::initialize(&config)?;
+    server::initialize_dirs(&config)?;
+    let ca = ca::CertificateAuthority::initialize(&config)?;
 
     // generate a test client cert
     let client_cert = ca.generate_agent_certificate("ODIN")?;
-    println!("client cert: {}", client_cert.pem());
 
-    let config = RustlsConfig::from_pem_file(
-        ca.server_cert_path(&config.server_name),
-        ca.server_key_path(&config.server_name),
-    )
-    .await
-    .unwrap();
+    // let config = RustlsConfig::from_pem_file(
+    //     ca.server_cert_path(&config.server_name),
+    //     ca.server_key_path(&config.server_name),
+    // )
+
+    // let store = load_store_from_pem("certs/ca-cert.pem").unwrap();
+    // let tls_config = RustlsConfig::from_config(Arc::new(
+    //     ServerConfig::builder()
+    //         .with_client_cert_verifier(client_cert_verifier)
+    //         .with_single_cert(certs, private_key)
+    //         .unwrap(),
+    // ));
+    let store = load_store_from_pem("/var/lib/caravel/ca/ca.crt").unwrap();
+    let client_verifier = WebPkiClientVerifier::builder(store.into()).build().unwrap();
+    let private_key = load_private_key_from_pem("/var/lib/caravel/server/localhost.key").unwrap();
+    let certs = load_certificates_from_pem("/var/lib/caravel/server/localhost.crt").unwrap();
+
+    // Build the TLS server configuration using Rustls's builder API.
+    let tls_config = ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(certs, private_key)
+        .expect("failed to build TLS config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
 
     let app = Router::new().route("/", get(handler));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 9140));
     tracing::debug!("listening on {}", addr);
-    axum_server::bind_rustls(addr, config)
+    axum_server::bind(addr)
+        .acceptor(acceptor.clone())
         .serve(app.into_make_service())
         .await
         .unwrap();
@@ -298,4 +72,33 @@ async fn main() -> Result<(), anyhow::Error> {
 
 async fn handler() -> &'static str {
     "Hello, World!"
+}
+
+pub fn load_certificates_from_pem(path: &str) -> std::io::Result<Vec<rustls::Certificate>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader).map(|c| c.unwrap().to_vec());
+
+    Ok(certs.map(rustls::Certificate).collect())
+}
+
+pub fn load_private_key_from_pem(path: &str) -> std::io::Result<rustls::PrivateKey> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let keys = rustls_pemfile::ec_private_keys(&mut reader)
+        .map(|k| k.unwrap())
+        .next()
+        .unwrap();
+
+    Ok(rustls::PrivateKey(keys.secret_sec1_der().to_vec()))
+}
+
+pub fn load_store_from_pem(path: &str) -> std::io::Result<rustls::RootCertStore> {
+    let ca_certs = load_certificates_from_pem(path)?;
+    let mut store = rustls::RootCertStore::empty();
+    for cert in &ca_certs {
+        store.add(cert).unwrap();
+    }
+
+    Ok(store)
 }
