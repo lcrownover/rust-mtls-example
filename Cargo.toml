@@ -1,0 +1,17 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.97"
+axum = "0.8.1"
+axum-extra = "0.10.0"
+axum-server = { version = "0.7.1", features = ["tls-rustls"] }
+rcgen = { version = "0.13.2", features = ["x509-parser"] }
+rustls-pemfile = "2.2.0"
+rustls-pki-types = "1.11.0"
+time = "0.3.39"
+tokio = { version = "1.44.0", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
