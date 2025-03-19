@@ -33,28 +33,20 @@ async fn main() -> Result<(), anyhow::Error> {
     let _client_cert = ca.generate_agent_certificate("UO-2010933")?;
 
     // load CA certs into root store and set up client verifier
-    let ca_certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(&ca.cert_pem_path)?
-        .map(|cert| cert.unwrap().into())
-        .collect();
-    let mut store = rustls::RootCertStore::empty();
-    for cert in ca_certs {
-        println!("{:?}", cert);
-        store.add(cert.clone()).unwrap();
-    }
-    let client_verifier = WebPkiClientVerifier::builder(store.into()).build()?;
+    let ca_cert = CertificateDer::from_pem_file(&ca.cert_pem_path)?;
+    let mut roots = rustls::RootCertStore::empty();
+    let _ = roots.add(ca_cert);
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots.clone())).build()?;
 
     // load server certs
-    let ca_certs: Vec<CertificateDer> =
-        CertificateDer::pem_file_iter(&ca.server_cert_path(&config.server_name))?
-            .map(|cert| cert.unwrap().into())
-            .collect();
-    let ca_private_key = PrivateKeyDer::from_pem_file(ca.server_key_path(&config.server_name))?;
+    let server_cert = CertificateDer::from_pem_file(&ca.server_cert_path(&config.server_name))?;
+    let server_key = PrivateKeyDer::from_pem_file(ca.server_key_path(&config.server_name))?;
 
     // Build the TLS server configuration using Rustls's builder API.
     let tls_config = ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
         // .with_no_client_auth()
-        .with_single_cert(ca_certs, ca_private_key)
+        .with_single_cert(vec![server_cert.clone()], server_key)
         .expect("failed to build TLS config");
     let server_config = RustlsConfig::from_config(Arc::new(tls_config));
     let app = Router::new().route("/", get(handler));

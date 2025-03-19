@@ -168,6 +168,9 @@ impl CertificateAuthority {
         params
             .extended_key_usages
             .push(ExtendedKeyUsagePurpose::ServerAuth);
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ClientAuth);
         params.not_before = today;
         params.not_after = forever;
 
