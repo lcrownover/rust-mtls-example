@@ -10,7 +10,7 @@ impl CaravelConfig {
     pub fn new() -> Self {
         let server_name = env::var("CARAVEL_SERVER_NAME").unwrap_or(String::from("localhost"));
         let data_path: PathBuf = env::var("CARAVEL_DATA_PATH")
-            .unwrap_or(String::from("/var/lib/caravel"))
+            .unwrap_or(String::from("/var/lib/caravel-rs"))
             .into();
 
         CaravelConfig {
