@@ -1,9 +1,10 @@
 pub mod ca;
 pub mod server;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{Router, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
+use ca::CertType;
 use core::net::SocketAddr;
 use rustls;
 use rustls::server::WebPkiClientVerifier;
@@ -26,37 +27,54 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let config = crate::server::CaravelConfig::new();
 
-    server::initialize_dirs(&config)?;
-    let ca = ca::CertificateAuthority::initialize(&config)?;
+    server::initialize(&config)?;
+    let ca = ca::CertificateAuthority::new(&config)?;
+    let _ = ca
+        .initialize()
+        .with_context(|| format!("failed to initialize ca"))?;
 
-    // generate a test client cert
-    let _client_cert = ca.generate_agent_certificate("UO-2010933")?;
+    // generate a test client cert as a test
+    let client_name = "UO-2010933";
+    let (client_cert, client_key) = ca
+        .generate_certificate(ca::CertType::Agent, client_name)
+        .with_context(|| format!("failed to generate client certificate"))?;
+    ca::write_certificate(
+        &ca.certificate_path(CertType::Agent, client_name),
+        &client_cert,
+    )?;
+    ca::write_key(&ca.key_path(CertType::Agent, client_name), &client_key)?;
 
     // load CA certs into root store and set up client verifier
-    let ca_cert = CertificateDer::from_pem_file(&ca.cert_pem_path)?;
+    let ca_cert = CertificateDer::from_pem_file(&ca.certificate_path(CertType::CA, "ca"))
+        .with_context(|| format!("failed to load ca certificate from disk"))?;
     let mut roots = rustls::RootCertStore::empty();
     let _ = roots.add(ca_cert);
-    let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots.clone())).build()?;
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots.clone()))
+        .build()
+        .with_context(|| format!("failed to build ca root store for client verification"))?;
 
     // load server certs
-    let server_cert = CertificateDer::from_pem_file(&ca.server_cert_path(&config.server_name))?;
-    let server_key = PrivateKeyDer::from_pem_file(ca.server_key_path(&config.server_name))?;
+    let server_cert =
+        CertificateDer::from_pem_file(&ca.certificate_path(CertType::Server, &config.server_name))
+            .with_context(|| format!("failed to load server certificate from disk"))?;
+    let server_key =
+        PrivateKeyDer::from_pem_file(ca.key_path(CertType::Server, &config.server_name))
+            .with_context(|| format!("failed to load server key from disk"))?;
 
     // Build the TLS server configuration using Rustls's builder API.
     let tls_config = ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
-        // .with_no_client_auth()
         .with_single_cert(vec![server_cert.clone()], server_key)
         .expect("failed to build TLS config");
     let server_config = RustlsConfig::from_config(Arc::new(tls_config));
+
     let app = Router::new().route("/", get(handler));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 9140));
     tracing::debug!("listening on {}", addr);
     axum_server::bind_rustls(addr, server_config)
         .serve(app.into_make_service())
-        .await
-        .unwrap();
+        .await?;
 
     Ok(())
 }
@@ -64,31 +82,3 @@ async fn main() -> Result<(), anyhow::Error> {
 async fn handler() -> &'static str {
     "Hello, World!"
 }
-
-// pub fn load_certificates_from_pem(path: &str) -> Result<CertificateDer> {
-//     // let file = File::open(path)?;
-//     // let mut reader = BufReader::new(file);
-//     // let certs = rustls_pemfile::certs(&mut reader).map(|c| c.unwrap().to_vec());
-//     let certs: Vec<_> = CertificateDer::pem_file_iter(path).unwrap().collect();
-//     let good: Vec<_> = certs.into_iter().collect();
-// }
-//
-// pub fn load_private_key_from_pem(path: &str) -> std::io::Result<PrivatePkcs8KeyDer> {
-//     let file = File::open(path)?;
-//     let mut reader = BufReader::new(file);
-//     let keys = rustls_pemfile::ec_private_keys(&mut reader)
-//         .map(|k| k.unwrap())
-//         .next()
-//         .unwrap();
-//
-//     Ok(rustls::PrivateKey(keys.secret_sec1_der().to_vec()))
-// }
-//
-// pub fn load_store_from_pem(path: &str) -> Result<rustls::RootCertStore> {
-//     let mut store = rustls::RootCertStore::empty();
-//     for cert in &ca_certs {
-//         store.add(cert).unwrap();
-//     }
-//
-//     Ok(store)
-// }

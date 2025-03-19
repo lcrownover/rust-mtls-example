@@ -20,7 +20,7 @@ impl CaravelConfig {
     }
 }
 
-pub fn initialize_dirs(config: &CaravelConfig) -> Result<()> {
+pub fn initialize(config: &CaravelConfig) -> Result<()> {
     tracing::debug!("initializing data path");
     if !config.data_path.exists() {
         fs::create_dir_all(&config.data_path).with_context(|| {
