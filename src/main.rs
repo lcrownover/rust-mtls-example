@@ -2,16 +2,9 @@ pub mod ca;
 pub mod server;
 
 use anyhow::{Context, Result};
-use axum::{Router, routing::get};
-use axum_server::tls_rustls::RustlsConfig;
-use ca::CertType;
-use core::net::SocketAddr;
-use rustls;
-use rustls::server::WebPkiClientVerifier;
-use rustls::{ServerConfig, pki_types::PrivateKeyDer};
-use rustls_pki_types::{CertificateDer, pem::PemObject};
 
-use std::sync::Arc;
+use server::CaravelServer;
+use tokio::sync::mpsc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -27,58 +20,27 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let config = crate::server::CaravelConfig::new();
 
-    server::initialize(&config)?;
-    let ca = ca::CertificateAuthority::new(&config)?;
-    let _ = ca
+    let caravel_ca = ca::CaravelCA::new(&config)?;
+    let _ = caravel_ca
         .initialize()
-        .with_context(|| format!("failed to initialize ca"))?;
+        .context(format!("failed to initialize ca"))?;
 
-    // generate a test client cert as a test
-    let client_name = "UO-2010933";
-    let (client_cert, client_key) = ca
-        .generate_certificate(ca::CertType::Agent, client_name)
-        .with_context(|| format!("failed to generate client certificate"))?;
-    ca::write_certificate(
-        &ca.certificate_path(CertType::Agent, client_name),
-        &client_cert,
-    )?;
-    ca::write_key(&ca.key_path(CertType::Agent, client_name), &client_key)?;
+    let caravel_server = CaravelServer::new(&config, caravel_ca.ca_path.clone());
+    caravel_server.initialize()?;
 
-    // load CA certs into root store and set up client verifier
-    let ca_cert = CertificateDer::from_pem_file(&ca.certificate_path(CertType::CA, "ca"))
-        .with_context(|| format!("failed to load ca certificate from disk"))?;
-    let mut roots = rustls::RootCertStore::empty();
-    let _ = roots.add(ca_cert);
-    let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots.clone()))
-        .build()
-        .with_context(|| format!("failed to build ca root store for client verification"))?;
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    let tx1 = shutdown_tx.clone();
+    let tx2 = shutdown_tx.clone();
 
-    // load server certs
-    let server_cert =
-        CertificateDer::from_pem_file(&ca.certificate_path(CertType::Server, &config.server_name))
-            .with_context(|| format!("failed to load server certificate from disk"))?;
-    let server_key =
-        PrivateKeyDer::from_pem_file(ca.key_path(CertType::Server, &config.server_name))
-            .with_context(|| format!("failed to load server key from disk"))?;
+    tokio::spawn(async move { caravel_ca.serve(tx1).await });
+    tokio::spawn(async move { caravel_server.serve(tx2).await });
 
-    // Build the TLS server configuration using Rustls's builder API.
-    let tls_config = ServerConfig::builder()
-        .with_client_cert_verifier(client_verifier)
-        .with_single_cert(vec![server_cert.clone()], server_key)
-        .expect("failed to build TLS config");
-    let server_config = RustlsConfig::from_config(Arc::new(tls_config));
+    shutdown_rx.recv().await;
+    tracing::info!("Shutting down");
 
-    let app = Router::new().route("/", get(handler));
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], 9140));
-    tracing::debug!("listening on {}", addr);
-    axum_server::bind_rustls(addr, server_config)
-        .serve(app.into_make_service())
-        .await?;
+    // let t0 = tokio::task::spawn(async move { caravel_ca.serve().await });
+    // let t1 = tokio::task::spawn(async move { caravel_server.serve().await });
+    // let _ = tokio::try_join!(t0, t1)?;
 
     Ok(())
-}
-
-async fn handler() -> &'static str {
-    "Hello, World!"
 }
